@@ -30,7 +30,7 @@ BAND_LOW = 30
 BAND_HIGH = 300
 
 # --- DATA COLLECTION PARAMETERS ---
-ACTIONS = ["Rest", "Right Arm"]
+ACTIONS = ["Relajado", "Brazo Derecho", "Brazo Izquierdo"]
 TRIALS_PER_ACTION = 20  # Increased to 10 to give the CNN more examples per class
 RECORD_DURATION = 4.0   # Seconds to record each action
 REST_DURATION = 2.0     # Seconds to rest between actions
@@ -263,7 +263,7 @@ class SessionManager:
 
         if self.state == "STARTING":
             self.label.setText(
-                "Starting in 3 seconds...\nRelax and get ready.")
+                "Empezando en 3 segundos...\nRelájate y prepárate")
             self.label.setStyleSheet("color: white; font-size: 32px;")
             if elapsed > 3.0:
                 self.transition_to_rest(now)
@@ -272,7 +272,7 @@ class SessionManager:
             remaining = max(0.0, REST_DURATION - elapsed)
             next_action = self.trial_sequence[self.current_trial]
             self.label.setText(
-                f"Rest...\nNext up: {next_action} ({remaining:.1f}s)")
+                f"Relájate...\nSiguiente: {next_action} ({remaining:.1f}s)")
             self.label.setStyleSheet(
                 "color: yellow; font-size: 36px; font-weight: bold;")
 
@@ -281,7 +281,7 @@ class SessionManager:
 
         elif self.state == "RECORD":
             action = self.trial_sequence[self.current_trial]
-            self.label.setText(f"ACTION:\n{action}")
+            self.label.setText(f"ACCIÓN:\n{action}")
             self.label.setStyleSheet(
                 "color: #00FF00; font-size: 48px; font-weight: bold;")
 

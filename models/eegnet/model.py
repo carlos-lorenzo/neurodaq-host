@@ -68,7 +68,7 @@ class EEGNet(nn.Module):
         and the pointwise convolution to avoid overfitting on noisy data.
         """
         with torch.no_grad():
-            for module in [self.block2_conv2, self.dense]:
+            for module in [self.block1_conv1, self.block2_conv2, self.dense]:
                 if hasattr(module, 'weight'):
                     norm = module.weight.norm(2, dim=0, keepdim=True)
                     desired = torch.clamp(norm, 0, max_norm_value)

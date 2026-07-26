@@ -27,8 +27,8 @@ pull_interval = 500  # ms between each pull operation
 CHANNEL_SPACING_UV = 250.0
 TRACE_WIDTH = 1.6
 LINE_NOISE_FREQ_HZ = 50.0
-BAND_LOW = 2
-BAND_HIGH = 150
+BAND_LOW = 4
+BAND_HIGH = 38
 INVERT_OUTPUT = False
 
 
