@@ -17,7 +17,7 @@ except ImportError:
 SERIAL_PORT = '/dev/ttyACM0'
 BAUD_RATE = 115200            # Matches standard ESP32 USB JTAG/Serial
 NUM_CHANNELS = 8
-CHANNEL_TO_STREAM = [0, 1, 2, 3, 4, 5, 6, 7]
+CHANNEL_TO_STREAM = [0]
 SAMPLE_RATE = 250          # Matches ADS1299_DR_250SPS from your C++ code
 VREF = 4.5                       # ADS1299 Internal Reference
 GAIN = 24.0                   # Matches ADS1299_PGA_GAIN_24

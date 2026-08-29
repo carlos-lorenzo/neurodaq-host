@@ -17,11 +17,11 @@ BAND_HIGH = 38.0  # Optimized for Beta band (motor imagery)
 
 # --- DATA COLLECTION & PARADIGM TIMINGS ---
 ACTIONS = ["Relajado", "Lado Izquierdo", "Lado Derecho"]
-TRIALS_PER_ACTION = 10
-PREP_DURATION = 2.0     # Crosshair to increase attention
-CUE_DURATION = 2.0      # Text indicating the task
+TRIALS_PER_ACTION = 20
+PREP_DURATION = 1.0     # Crosshair to increase attention
+CUE_DURATION = 1.0      # Text indicating the task
 RECORD_DURATION = 4.0   # Dynamic GIF execution and data recording
-RELAX_DURATION = 5.0    # Rest between trials
+RELAX_DURATION = 2.0    # Rest between trials
 
 # --- INTERFACE CONSTANTS ---
 PULL_INTERVAL_MS = 50
@@ -62,7 +62,7 @@ class DataInlet:
         self.plot_buffer = np.zeros((PLOT_BUFFER_SAMPLES, self.channel_count))
 
         # Filtering setup (Notch for line noise, Bandpass for ERD/ERS 4-38Hz)
-        b_notch, a_notch = signal.iirnotch(LINE_NOISE_FREQ_HZ, 30.0, self.fs)
+        b_notch, a_notch = signal.iirnotch(LINE_NOISE_FREQ_HZ, 10.0, self.fs)
         self.sos_notch = np.hstack((b_notch, a_notch)).reshape(1, 6)
         self.sos_bp = signal.butter(
             4, [BAND_LOW, BAND_HIGH], btype="bandpass", fs=self.fs, output="sos")
