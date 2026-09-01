@@ -55,7 +55,7 @@ These exist only in the legacy scripts today, which is why the migration matters
 |---|---|
 | `neurodaq_gui.py` | The current application. |
 | `_deprecated/` | Single-purpose scripts being migrated into subsystems — see its [README](_deprecated/README.md). Several are still the only implementation of a capability. |
-| `data/` | Recorded datasets in two `.npz` schemas — see its [README](data/README.md). |
+| `data/` | Recorded datasets in two `.npz` schemas, extremely unorganised — see its [README](data/README.md). |
 | `analysis/` | Jupyter notebooks (signal quality, spectra, CNN training). |
 | `models/` | EEGNet implementation for the motor-imagery experiments. |
 
