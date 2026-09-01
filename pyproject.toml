@@ -1,7 +1,7 @@
 [project]
 name = "neurodaq-host"
 version = "0.1.0"
-description = "Add your description here"
+description = "Host software for NeuroDAQ: live GUI, recording, and analysis for the 8-channel ADS1299 EEG stream"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -10,4 +10,20 @@ dependencies = [
     "pyqt5>=5.15.11",
     "pyqtgraph>=0.14.0",
     "scipy>=1.18.1",
+]
+
+[project.optional-dependencies]
+analysis = [
+    "matplotlib>=3.9",
+    "seaborn>=0.13",
+    "scikit-learn>=1.5",
+    "mne>=1.7",
+    "mne-icalabel>=0.7",
+]
+ml = [
+    "torch>=2.3",
+]
+tools = [
+    "pyserial>=3.5",
+    "questionary>=2.0",
 ]
