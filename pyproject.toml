@@ -4,4 +4,10 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "numpy>=2.5.2",
+    "pylsl>=1.18.2",
+    "pyqt5>=5.15.11",
+    "pyqtgraph>=0.14.0",
+    "scipy>=1.18.1",
+]

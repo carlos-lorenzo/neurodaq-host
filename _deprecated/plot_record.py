@@ -8,11 +8,61 @@ import pylsl
 from scipy.signal import butter, iirnotch, sosfiltfilt, filtfilt
 
 # Configuration Constants
-PULL_INTERVAL_MS = 40  # Timer interval for pulling data and updating UI
-PLOT_BUFFER_SAMPLES = 5000  # Number of samples displayed on the graph
+PULL_INTERVAL_MS = 100  # Timer interval for pulling data and updating UI
+PLOT_BUFFER_SAMPLES = 3000  # Number of samples displayed on the graph
 
 
-def apply_signal_filters(data, fs, bp_enabled, bp_low, bp_high, bp_order, notch_enabled, notch_freq, notch_q):
+class CustomAxisItem(pg.AxisItem):
+    """Custom AxisItem that routes mouse scroll wheel events strictly to its own axis."""
+
+    def wheelEvent(self, ev):
+        vb = self.linkedView()
+        if vb is not None:
+            # 0 = X-axis (bottom/top), 1 = Y-axis (left/right)
+            axis_idx = 0 if self.orientation in ("bottom", "top") else 1
+            vb.wheelEvent(ev, axis=axis_idx)
+            ev.accept()
+
+
+class CustomViewBox(pg.ViewBox):
+    """Custom ViewBox allowing independent single-axis zooming via mouse scroll wheel."""
+
+    def wheelEvent(self, ev, axis=None):
+        if axis is not None:
+            # Explicit axis provided by CustomAxisItem (0 for X, 1 for Y)
+            super().wheelEvent(ev, axis=axis)
+            return
+
+        # If scrolling inside the plot area itself, route zoom based on cursor location
+        pos = ev.pos()
+        rect = self.rect()
+
+        rel_x = pos.x() / rect.width() if rect.width() > 0 else 0.5
+        rel_y = pos.y() / rect.height() if rect.height() > 0 else 0.5
+
+        # Distance to bottom edge (X axis) vs left edge (Y axis)
+        dist_to_bottom = 1.0 - rel_y
+        dist_to_left = rel_x
+
+        if dist_to_bottom < dist_to_left:
+            # Zoom X-axis only
+            super().wheelEvent(ev, axis=0)
+        else:
+            # Zoom Y-axis only
+            super().wheelEvent(ev, axis=1)
+
+
+def apply_signal_filters(
+    data,
+    fs,
+    bp_enabled,
+    bp_low,
+    bp_high,
+    bp_order,
+    notch_enabled,
+    notch_freq,
+    notch_q,
+):
     """Applies Butterworth Bandpass and IIR Notch filters along time axis (axis=0)."""
     if data.size == 0 or data.shape[0] < 15 or fs <= 0:
         return data
@@ -31,8 +81,9 @@ def apply_signal_filters(data, fs, bp_enabled, bp_low, bp_high, bp_order, notch_
     # 2. Bandpass Filter
     if bp_enabled and 0 < bp_low < bp_high < nyq:
         try:
-            sos = butter(bp_order, [bp_low, bp_high],
-                         btype='bandpass', fs=fs, output='sos')
+            sos = butter(
+                bp_order, [bp_low, bp_high], btype="bandpass", fs=fs, output="sos"
+            )
             filtered = sosfiltfilt(sos, filtered, axis=0)
         except Exception:
             pass
@@ -123,15 +174,20 @@ class EEGRecorderApp(QtWidgets.QWidget):
         self.btn_stop.clicked.connect(self.stop_recording)
 
         # Sample Rate Display Label
-        fs_display = ", ".join(
-            [f"{inl.fs:.1f} Hz" for inl in self.inlets]) if self.inlets else "N/A"
+        fs_display = (
+            ", ".join([f"{inl.fs:.1f} Hz" for inl in self.inlets])
+            if self.inlets
+            else "N/A"
+        )
         self.lbl_fs = QtWidgets.QLabel(f"Sample Rate: {fs_display}")
         self.lbl_fs.setStyleSheet(
-            "font-size: 13px; font-weight: bold; color: #17a2b8; margin-left: 10px;")
+            "font-size: 13px; font-weight: bold; color: #17a2b8; margin-left: 10px;"
+        )
 
         self.status_label = QtWidgets.QLabel("Status: Idle")
         self.status_label.setStyleSheet(
-            "font-size: 13px; font-weight: bold; margin-left: 10px;")
+            "font-size: 13px; font-weight: bold; margin-left: 10px;"
+        )
 
         control_layout.addWidget(self.btn_start)
         control_layout.addWidget(self.btn_stop)
@@ -211,8 +267,17 @@ class EEGRecorderApp(QtWidgets.QWidget):
         self.spn_bp_high.valueChanged.connect(self.enforce_nyquist_limits)
         self.spn_notch_freq.valueChanged.connect(self.enforce_nyquist_limits)
 
+        # Custom Axis & ViewBox Setup for independent per-axis zoom
+        axis_x = CustomAxisItem("bottom")
+        axis_y = CustomAxisItem("left")
+        custom_vb = CustomViewBox()
+
         # PyQtGraph Live Plotting Oscilloscope Widget
-        self.plot_widget = pg.PlotWidget(title="Live EEG Signal Waveforms")
+        self.plot_widget = pg.PlotWidget(
+            viewBox=custom_vb,
+            axisItems={"bottom": axis_x, "left": axis_y},
+            title="Live EEG Signal Waveforms",
+        )
         self.plot_widget.setBackground("#101318")
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self.plot_widget.setLabel("left", "Voltage Offset (uV)")
@@ -245,13 +310,13 @@ class EEGRecorderApp(QtWidgets.QWidget):
     def get_filter_params(self):
         """Retrieves user filter settings."""
         return {
-            'bp_enabled': self.chk_bp.isChecked(),
-            'bp_low': self.spn_bp_low.value(),
-            'bp_high': self.spn_bp_high.value(),
-            'bp_order': self.spn_bp_order.value(),
-            'notch_enabled': self.chk_notch.isChecked(),
-            'notch_freq': self.spn_notch_freq.value(),
-            'notch_q': self.spn_notch_q.value()
+            "bp_enabled": self.chk_bp.isChecked(),
+            "bp_low": self.spn_bp_low.value(),
+            "bp_high": self.spn_bp_high.value(),
+            "bp_order": self.spn_bp_order.value(),
+            "notch_enabled": self.chk_notch.isChecked(),
+            "notch_freq": self.spn_notch_freq.value(),
+            "notch_q": self.spn_notch_q.value(),
         }
 
     def start_recording(self):
@@ -262,7 +327,8 @@ class EEGRecorderApp(QtWidgets.QWidget):
         self.btn_stop.setEnabled(True)
         self.status_label.setText("Status: Recording...")
         self.status_label.setStyleSheet(
-            "color: #ffc107; font-size: 13px; font-weight: bold;")
+            "color: #ffc107; font-size: 13px; font-weight: bold;"
+        )
 
     def stop_recording(self):
         """Stops recording and dumps buffered data into a NumPy archive."""
@@ -289,7 +355,8 @@ class EEGRecorderApp(QtWidgets.QWidget):
         self.btn_stop.setEnabled(False)
         self.status_label.setText(f"Status: Saved data to '{filename}'")
         self.status_label.setStyleSheet(
-            "color: #28a745; font-size: 13px; font-weight: bold;")
+            "color: #28a745; font-size: 13px; font-weight: bold;"
+        )
 
     def update_loop(self):
         """Pulls LSL data and updates signal visualization curves."""
@@ -336,7 +403,8 @@ def main():
     for info in streams:
         if info.nominal_srate() != pylsl.IRREGULAR_RATE:
             print(
-                f"Connecting to LSL Stream: {info.name()} ({info.nominal_srate()} Hz)")
+                f"Connecting to LSL Stream: {info.name()} ({info.nominal_srate()} Hz)"
+            )
             inlets.append(LSLStreamInlet(info))
 
     gui = EEGRecorderApp(inlets)
@@ -345,7 +413,8 @@ def main():
     if not inlets:
         gui.status_label.setText("Status: No LSL streams detected!")
         gui.status_label.setStyleSheet(
-            "color: #dc3545; font-size: 13px; font-weight: bold;")
+            "color: #dc3545; font-size: 13px; font-weight: bold;"
+        )
 
     sys.exit(app.exec_())
 
