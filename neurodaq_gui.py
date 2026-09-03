@@ -7,6 +7,7 @@ import struct
 import numpy as np
 from datetime import datetime
 from scipy.signal import butter, iirnotch, sosfiltfilt, filtfilt
+from scipy.interpolate import Rbf, griddata
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
@@ -98,6 +99,30 @@ EEG_BANDS = {
 }
 
 
+def build_dracula_lut():
+    """Generates a 256-step RGBA Lookup Table for smooth EEG heatmap rendering."""
+    stops = [
+        (0.00, (40, 42, 54)),     # Dracula BG
+        (0.20, (98, 114, 164)),   # Dracula Comment/Blue
+        (0.40, (139, 233, 253)),  # Dracula Cyan
+        (0.60, (80, 250, 123)),   # Dracula Green
+        (0.80, (241, 250, 140)),  # Dracula Yellow
+        (1.00, (255, 121, 198)),  # Dracula Pink
+    ]
+    lut = np.zeros((256, 4), dtype=np.uint8)
+    x = [s[0] for s in stops]
+    r = [s[1][0] for s in stops]
+    g = [s[1][1] for s in stops]
+    b = [s[1][2] for s in stops]
+
+    xp = np.linspace(0, 1, 256)
+    lut[:, 0] = np.interp(xp, x, r)
+    lut[:, 1] = np.interp(xp, x, g)
+    lut[:, 2] = np.interp(xp, x, b)
+    lut[:, 3] = 220  # High opacity for vivid heatmap
+    return lut
+
+
 # ==============================================================================
 # CUSTOM PYQTGRAPH INTERACTION UTILITIES
 # ==============================================================================
@@ -133,22 +158,23 @@ def apply_signal_filters(
     data,
     fs,
     dc_remove,
-    bp_enabled,
-    bp_low,
-    bp_high,
-    bp_order,
+    hp_enabled,
+    hp_freq,
+    hp_order,
+    lp_enabled,
+    lp_freq,
+    lp_order,
     notch_enabled,
     notch_freq,
     notch_q,
 ):
-    """Applies DC Offset Removal (Baseline Mean Subtraction), IIR Notch, and Bandpass Filters."""
+    """Applies DC Offset Removal, Independent Highpass/Lowpass, and Notch Filters."""
     if data.size == 0 or data.shape[0] < 15 or fs <= 0:
         return data
 
     nyq = fs / 2.0
     filtered = data.copy()
 
-    # Subtract per-channel baseline mean (removes 0 Hz DC offset without altering AC spectrum)
     if dc_remove:
         filtered = filtered - np.mean(filtered, axis=0)
 
@@ -159,11 +185,18 @@ def apply_signal_filters(
         except Exception:
             pass
 
-    if bp_enabled and 0 < bp_low < bp_high < nyq:
+    if hp_enabled and 0 < hp_freq < nyq:
         try:
-            sos = butter(
-                bp_order, [bp_low, bp_high], btype="bandpass", fs=fs, output="sos"
-            )
+            sos = butter(hp_order, hp_freq, btype="highpass",
+                         fs=fs, output="sos")
+            filtered = sosfiltfilt(sos, filtered, axis=0)
+        except Exception:
+            pass
+
+    if lp_enabled and 0 < lp_freq < nyq:
+        try:
+            sos = butter(lp_order, lp_freq, btype="lowpass",
+                         fs=fs, output="sos")
             filtered = sosfiltfilt(sos, filtered, axis=0)
         except Exception:
             pass
@@ -269,9 +302,7 @@ class TCPControlWorker(QtCore.QThread):
                     resp = json.loads(buf)
                     self.response_received.emit(resp)
                 except Exception as e:
-                    self.connection_status.emit(
-                        False, f"TCP Error: {str(e)}"
-                    )
+                    self.connection_status.emit(False, f"TCP Error: {str(e)}")
                     self.sock = None
 
             self.msleep(20)
@@ -429,13 +460,14 @@ class UDPDataReceiver(QtCore.QThread):
 
 
 # ==============================================================================
-# MAIN APPLICATION GUI (DRACULA THEME WITH 10-20 BRAIN MAPPING)
+# MAIN APPLICATION GUI (DRACULA THEME WITH CENTERED HEATMAP ALIGNMENT)
 # ==============================================================================
 class NeuroDAQGUI(QtWidgets.QMainWindow):
 
     def __init__(self):
         super().__init__()
         self.sample_rate = 250.0
+        self.channel_offset = 100.0
         self.gains = [24.0] * N_CHANNELS
         self.powerdowns = [0] * N_CHANNELS
         self.visible_channels = [True] * N_CHANNELS
@@ -444,15 +476,29 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         self.plot_buffer_len = int(self.sample_rate * 3.0)
         self.data_buffer = np.zeros((self.plot_buffer_len, N_CHANNELS))
 
+        # Recording state variables
+        self.is_recording = False
+        self.recorded_chunks = []
+
         # DSP Filter Parameters
         self.dc_remove_enabled = True
-        self.bp_enabled = True
-        self.bp_low = 1.0
-        self.bp_high = 40.0
-        self.bp_order = 4
+        self.hp_enabled = True
+        self.hp_freq = 1.0
+        self.hp_order = 4
+        self.lp_enabled = True
+        self.lp_freq = 40.0
+        self.lp_order = 4
         self.notch_enabled = True
         self.notch_freq = 50.0
         self.notch_q = 30.0
+
+        # Heatmap Interpolation Grid & Bounds Setup
+        self.grid_res = 120
+        self.heatmap_rect = QtCore.QRectF(-1.1, -1.1, 2.2, 2.2)
+        grid_1d = np.linspace(-1.1, 1.1, self.grid_res)
+        self.grid_x, self.grid_y = np.meshgrid(grid_1d, grid_1d)
+        self.head_mask = (self.grid_x**2 + self.grid_y**2) > 1.0
+        self.dracula_lut = build_dracula_lut()
 
         self.tcp_worker = TCPControlWorker()
         self.tcp_worker.connection_status.connect(
@@ -470,7 +516,7 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
 
     def init_ui(self):
         self.setWindowTitle(
-            "NeuroDAQ Master Station — Dracula Control Suite & 10-20 Topo Map"
+            "NeuroDAQ Master Station — Dracula Suite & Live Topographic Heatmap"
         )
         self.resize(1450, 950)
 
@@ -551,7 +597,7 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         top_layout = QtWidgets.QVBoxLayout(main_widget)
 
         # ----------------------------------------------------------------------
-        # TOP BAR: TCP Connection & Master Controls
+        # TOP BAR: TCP Connection, Master Controls, & Recording Options
         # ----------------------------------------------------------------------
         bar_layout = QtWidgets.QHBoxLayout()
 
@@ -583,8 +629,23 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         self.btn_reset = QtWidgets.QPushButton("RESET")
         self.btn_reset.clicked.connect(lambda: self.send_cmd("reset"))
 
+        self.cmb_record_mode = QtWidgets.QComboBox()
+        self.cmb_record_mode.addItems(["Raw Data", "Filtered Data"])
+
+        self.btn_record = QtWidgets.QPushButton("Start Recording")
+        self.btn_record.setStyleSheet(
+            f"background-color: {DRACULA['pink']}; color: #1e1f29;"
+        )
+        self.btn_record.clicked.connect(self.toggle_recording)
+
+        self.lbl_record_status = QtWidgets.QLabel("Rec: Idle")
+        self.lbl_record_status.setStyleSheet(
+            f"color: {DRACULA['comment']}; font-weight: bold;"
+        )
+
         self.lbl_srate = QtWidgets.QLabel(
-            f"Sampling Rate: {self.sample_rate} Hz")
+            f"Sampling Rate: {self.sample_rate} Hz"
+        )
         self.lbl_srate.setStyleSheet(
             f"color: {DRACULA['cyan']}; font-weight: bold;"
         )
@@ -598,6 +659,12 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         bar_layout.addWidget(self.btn_start)
         bar_layout.addWidget(self.btn_stop)
         bar_layout.addWidget(self.btn_reset)
+
+        bar_layout.addWidget(QtWidgets.QLabel(" | Rec Mode:"))
+        bar_layout.addWidget(self.cmb_record_mode)
+        bar_layout.addWidget(self.btn_record)
+        bar_layout.addWidget(self.lbl_record_status)
+
         bar_layout.addStretch()
         bar_layout.addWidget(self.lbl_srate)
 
@@ -615,36 +682,37 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         tab_graphs = QtWidgets.QWidget()
         graph_layout = QtWidgets.QVBoxLayout(tab_graphs)
 
-        # DSP Filter Panel with DC Offset Removal Checkbox
         filter_group = QtWidgets.QGroupBox(
-            "DSP Signal Conditioning & Dynamic Notch Configuration"
+            "DSP Signal Conditioning & Independent Filters Configuration"
         )
         flt_grid = QtWidgets.QGridLayout(filter_group)
 
-        # DC Offset Removal Option
         self.chk_dc_remove = QtWidgets.QCheckBox(
             "Remove DC Offset (Mean Subtraction)")
         self.chk_dc_remove.setChecked(True)
-        self.chk_dc_remove.setToolTip(
-            "Subtracts signal mean to remove baseline offset while preserving all AC spectrum frequencies."
-        )
         self.chk_dc_remove.toggled.connect(self.on_filter_changed)
 
-        self.chk_bp = QtWidgets.QCheckBox("Enable Bandpass")
-        self.chk_bp.setChecked(True)
-        self.chk_bp.toggled.connect(self.on_filter_changed)
+        self.chk_hp = QtWidgets.QCheckBox("Enable Highpass")
+        self.chk_hp.setChecked(True)
+        self.chk_hp.toggled.connect(self.on_filter_changed)
 
-        self.spn_bp_low = QtWidgets.QDoubleSpinBox()
-        self.spn_bp_low.setPrefix("Low: ")
-        self.spn_bp_low.setSuffix(" Hz")
-        self.spn_bp_low.setValue(1.0)
-        self.spn_bp_low.valueChanged.connect(self.on_filter_changed)
+        self.spn_hp_freq = QtWidgets.QDoubleSpinBox()
+        self.spn_hp_freq.setPrefix("HP: ")
+        self.spn_hp_freq.setSuffix(" Hz")
+        self.spn_hp_freq.setValue(1.0)
+        self.spn_hp_freq.setSingleStep(0.5)
+        self.spn_hp_freq.valueChanged.connect(self.on_filter_changed)
 
-        self.spn_bp_high = QtWidgets.QDoubleSpinBox()
-        self.spn_bp_high.setPrefix("High: ")
-        self.spn_bp_high.setSuffix(" Hz")
-        self.spn_bp_high.setValue(40.0)
-        self.spn_bp_high.valueChanged.connect(self.on_filter_changed)
+        self.chk_lp = QtWidgets.QCheckBox("Enable Lowpass")
+        self.chk_lp.setChecked(True)
+        self.chk_lp.toggled.connect(self.on_filter_changed)
+
+        self.spn_lp_freq = QtWidgets.QDoubleSpinBox()
+        self.spn_lp_freq.setPrefix("LP: ")
+        self.spn_lp_freq.setSuffix(" Hz")
+        self.spn_lp_freq.setValue(40.0)
+        self.spn_lp_freq.setSingleStep(1.0)
+        self.spn_lp_freq.valueChanged.connect(self.on_filter_changed)
 
         self.chk_notch = QtWidgets.QCheckBox("Enable Notch")
         self.chk_notch.setChecked(True)
@@ -666,18 +734,27 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         self.chk_show_filtered = QtWidgets.QCheckBox("View Filtered Signals")
         self.chk_show_filtered.setChecked(True)
 
+        self.spn_offset = QtWidgets.QDoubleSpinBox()
+        self.spn_offset.setPrefix("Offset: ")
+        self.spn_offset.setSuffix(" uV")
+        self.spn_offset.setRange(0.0, 10000.0)
+        self.spn_offset.setValue(100.0)
+        self.spn_offset.setSingleStep(10.0)
+        self.spn_offset.valueChanged.connect(self.on_offset_changed)
+
         flt_grid.addWidget(self.chk_dc_remove, 0, 0, 1, 2)
-        flt_grid.addWidget(self.chk_bp, 0, 2)
-        flt_grid.addWidget(self.spn_bp_low, 0, 3)
-        flt_grid.addWidget(self.spn_bp_high, 0, 4)
-        flt_grid.addWidget(self.chk_notch, 0, 5)
-        flt_grid.addWidget(self.spn_notch_freq, 0, 6)
-        flt_grid.addWidget(self.spn_notch_q, 0, 7)
-        flt_grid.addWidget(self.chk_show_filtered, 0, 8)
+        flt_grid.addWidget(self.chk_hp, 0, 2)
+        flt_grid.addWidget(self.spn_hp_freq, 0, 3)
+        flt_grid.addWidget(self.chk_lp, 0, 4)
+        flt_grid.addWidget(self.spn_lp_freq, 0, 5)
+        flt_grid.addWidget(self.chk_notch, 0, 6)
+        flt_grid.addWidget(self.spn_notch_freq, 0, 7)
+        flt_grid.addWidget(self.spn_notch_q, 0, 8)
+        flt_grid.addWidget(self.chk_show_filtered, 0, 9)
+        flt_grid.addWidget(self.spn_offset, 0, 10)
 
         graph_layout.addWidget(filter_group)
 
-        # Plot Splitter
         graph_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
 
         axis_x1 = CustomAxisItem("bottom")
@@ -722,36 +799,41 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         self.tabs.addTab(tab_graphs, "Oscilloscope & FFT Spectrum")
 
         # ======================================================================
-        # TAB 2: 10-20 Brain Activity Mapping & Frequency Band Visualizer
+        # TAB 2: 10-20 Live Brain Heatmap & Frequency Band Visualizer
         # ======================================================================
         tab_topo = QtWidgets.QWidget()
         topo_layout = QtWidgets.QHBoxLayout(tab_topo)
 
-        # Left Column: 10-20 Scalp Topo Map Plot
         topo_box = QtWidgets.QGroupBox(
-            "10-20 System Topographic Head Map"
+            "10-20 System Live Topographic Scalp Surface Heatmap"
         )
         topo_vbox = QtWidgets.QVBoxLayout(topo_box)
 
         self.plot_topo = pg.PlotWidget()
         self.plot_topo.setBackground(DRACULA["bg"])
         self.plot_topo.setAspectLocked(True)
+        self.plot_topo.setRange(xRange=[-1.25, 1.25], yRange=[-1.25, 1.25])
         self.plot_topo.hideAxis("left")
         self.plot_topo.hideAxis("bottom")
 
-        # Draw Scalp Boundary Ellipse & Features (Nose, Ears)
+        # 1. HEATMAP IMAGE ITEM (LAYER 0 - UNDERNEATH Scalp Annotations)
+        self.topo_img = pg.ImageItem()
+        self.topo_img.setRect(self.heatmap_rect)
+        self.plot_topo.addItem(self.topo_img)
+
+        # 2. SCALP BOUNDARY & ANATOMICAL HEAD FEATURES (Nose & Ears)
         angles = np.linspace(0, 2 * np.pi, 200)
         scalp_x = np.cos(angles)
         scalp_y = np.sin(angles)
         self.plot_topo.plot(
-            scalp_x, scalp_y, pen=pg.mkPen(DRACULA["comment"], width=2)
+            scalp_x, scalp_y, pen=pg.mkPen(DRACULA["fg"], width=2)
         )
 
         # Nose
         nose_x = [-0.15, 0.0, 0.15]
         nose_y = [0.98, 1.15, 0.98]
         self.plot_topo.plot(
-            nose_x, nose_y, pen=pg.mkPen(DRACULA["comment"], width=2)
+            nose_x, nose_y, pen=pg.mkPen(DRACULA["fg"], width=2)
         )
 
         # Left / Right Ears
@@ -760,14 +842,16 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         ear_r_x = [1.0, 1.08, 1.08, 1.0]
         ear_r_y = [0.2, 0.1, -0.1, -0.2]
         self.plot_topo.plot(
-            ear_l_x, ear_l_y, pen=pg.mkPen(DRACULA["comment"], width=2)
+            ear_l_x, ear_l_y, pen=pg.mkPen(DRACULA["fg"], width=2)
         )
         self.plot_topo.plot(
-            ear_r_x, ear_r_y, pen=pg.mkPen(DRACULA["comment"], width=2)
+            ear_r_x, ear_r_y, pen=pg.mkPen(DRACULA["fg"], width=2)
         )
 
-        # Electrode Scatter Points & Text Labels
-        self.scatter_nodes = pg.ScatterPlotItem(size=24, pen=pg.mkPen(None))
+        # 3. OVERLAID ELECTRODE NODES & LABELS (LAYER 2)
+        self.scatter_nodes = pg.ScatterPlotItem(
+            size=16, pen=pg.mkPen(DRACULA["bg"], width=1.5)
+        )
         self.plot_topo.addItem(self.scatter_nodes)
         self.topo_text_items = []
 
@@ -778,7 +862,6 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         analysis_box = QtWidgets.QGroupBox("Brain Activity & Spectral Power")
         analysis_vbox = QtWidgets.QVBoxLayout(analysis_box)
 
-        # Selector for Band Focus
         band_sel_lay = QtWidgets.QHBoxLayout()
         band_sel_lay.addWidget(QtWidgets.QLabel("Focused EEG Band:"))
         self.cmb_band_select = QtWidgets.QComboBox()
@@ -789,7 +872,6 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         band_sel_lay.addStretch()
         analysis_vbox.addLayout(band_sel_lay)
 
-        # Brain Region Activity Bar Chart
         self.plot_region_bar = pg.PlotWidget(
             title="Activity Power by Anatomical Brain Region"
         )
@@ -810,7 +892,6 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         ]
         self.plot_region_bar.getAxis("bottom").setTicks([ticks])
 
-        # Frequency Band Power Comparison Bar Chart
         self.plot_band_bar = pg.PlotWidget(title="Global Spectrum Band Power")
         self.plot_band_bar.setBackground(DRACULA["bg"])
         self.plot_band_bar.setLabel("left", "Power (uV²)")
@@ -828,7 +909,7 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         analysis_vbox.addWidget(self.plot_band_bar)
         topo_layout.addWidget(analysis_box, stretch=4)
 
-        self.tabs.addTab(tab_topo, "10-20 Brain Map & Band Power")
+        self.tabs.addTab(tab_topo, "10-20 Heatmap & Band Power")
 
         # ======================================================================
         # TAB 3: Hardware Configuration & 10-20 Mapping Setup
@@ -836,7 +917,6 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         tab_config = QtWidgets.QWidget()
         config_layout = QtWidgets.QVBoxLayout(tab_config)
 
-        # Global Config Group
         grp_global = QtWidgets.QGroupBox("Global Hardware Settings")
         g_lay = QtWidgets.QHBoxLayout(grp_global)
 
@@ -854,9 +934,9 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         g_lay.addStretch()
         config_layout.addWidget(grp_global)
 
-        # HARDWARE BIAS DRIVE CONTROL PANEL
         grp_bias = QtWidgets.QGroupBox(
-            "BIAS Drive & Common-Mode Noise Rejection")
+            "BIAS Drive & Common-Mode Noise Rejection"
+        )
         bias_vbox = QtWidgets.QVBoxLayout(grp_bias)
 
         bias_top_lay = QtWidgets.QHBoxLayout()
@@ -899,7 +979,6 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         bias_vbox.addLayout(bias_grid)
         config_layout.addWidget(grp_bias)
 
-        # Channel & 10-20 Electrode Setup Matrix
         grp_channels = QtWidgets.QGroupBox(
             "Per-Channel Hardware Matrix & 10-20 System Mapping"
         )
@@ -932,7 +1011,6 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
                 ch, 0, QtWidgets.QTableWidgetItem(f"Channel {ch+1}")
             )
 
-            # 10-20 Electrode Selector Combo Box
             cmb_1020 = QtWidgets.QComboBox()
             for pos_label in ELECTRODE_1020_POS.keys():
                 cmb_1020.addItem(pos_label)
@@ -1086,6 +1164,9 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
     # ==========================================================================
     # LOGIC & EVENT HANDLERS
     # ==========================================================================
+    def on_offset_changed(self, value):
+        self.channel_offset = value
+
     def toggle_tcp_connection(self):
         if self.tcp_worker.sock is None:
             host = self.txt_ip.text().strip()
@@ -1112,6 +1193,81 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
 
     def on_tcp_response(self, resp):
         print(f"[TCP Response] {resp}")
+
+    def toggle_recording(self):
+        if not self.is_recording:
+            self.recorded_chunks = []
+            self.is_recording = True
+            self.btn_record.setText("Stop & Save (.npz)")
+            self.btn_record.setStyleSheet(
+                f"background-color: {DRACULA['orange']}; color: #1e1f29;"
+            )
+            self.cmb_record_mode.setEnabled(False)
+            self.lbl_record_status.setText("Rec: 0 samples")
+            self.lbl_record_status.setStyleSheet(
+                f"color: {DRACULA['pink']}; font-weight: bold;"
+            )
+        else:
+            self.is_recording = False
+            self.btn_record.setText("Start Recording")
+            self.btn_record.setStyleSheet(
+                f"background-color: {DRACULA['pink']}; color: #1e1f29;"
+            )
+            self.cmb_record_mode.setEnabled(True)
+            self.lbl_record_status.setStyleSheet(
+                f"color: {DRACULA['comment']}; font-weight: bold;"
+            )
+
+            if not self.recorded_chunks:
+                self.lbl_record_status.setText("Rec: No data")
+                return
+
+            raw_data = np.vstack(self.recorded_chunks)
+            mode = self.cmb_record_mode.currentText()
+
+            if mode == "Filtered Data":
+                save_data = apply_signal_filters(
+                    raw_data,
+                    self.sample_rate,
+                    self.dc_remove_enabled,
+                    self.hp_enabled,
+                    self.hp_freq,
+                    self.hp_order,
+                    self.lp_enabled,
+                    self.lp_freq,
+                    self.lp_order,
+                    self.notch_enabled,
+                    self.notch_freq,
+                    self.notch_q,
+                )
+            else:
+                save_data = raw_data
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            mode_str = "raw" if mode == "Raw Data" else "filtered"
+            filename = f"eeg_record_{mode_str}_{timestamp}.npz"
+
+            try:
+                np.savez_compressed(
+                    filename,
+                    data=save_data,
+                    sample_rate=self.sample_rate,
+                    mode=mode_str,
+                    electrode_mapping=self.electrode_mappings,
+                )
+                self.lbl_record_status.setText(f"Saved: {filename}")
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Recording Saved",
+                    f"Successfully saved {len(save_data)} samples to {filename} ({mode_str}).",
+                )
+            except Exception as e:
+                self.lbl_record_status.setText("Save Failed")
+                QtWidgets.QMessageBox.critical(
+                    self, "Save Error", f"Failed to save recording: {str(e)}"
+                )
+
+            self.recorded_chunks = []
 
     def update_electrode_mapping(self, ch_idx, pos_label):
         self.electrode_mappings[ch_idx] = pos_label
@@ -1215,16 +1371,17 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
     def enforce_nyquist_limits(self):
         nyquist = self.sample_rate / 2.0
         max_freq = max(0.1, nyquist - 0.1)
-        self.spn_bp_high.setMaximum(max_freq)
-        self.spn_bp_low.setMaximum(max_freq - 0.1)
+        self.spn_hp_freq.setMaximum(max_freq)
+        self.spn_lp_freq.setMaximum(max_freq)
         self.spn_notch_freq.setMaximum(max_freq)
 
     def on_filter_changed(self):
         self.enforce_nyquist_limits()
         self.dc_remove_enabled = self.chk_dc_remove.isChecked()
-        self.bp_enabled = self.chk_bp.isChecked()
-        self.bp_low = self.spn_bp_low.value()
-        self.bp_high = self.spn_bp_high.value()
+        self.hp_enabled = self.chk_hp.isChecked()
+        self.hp_freq = self.spn_hp_freq.value()
+        self.lp_enabled = self.chk_lp.isChecked()
+        self.lp_freq = self.spn_lp_freq.value()
         self.notch_enabled = self.chk_notch.isChecked()
         self.notch_freq = self.spn_notch_freq.value()
         self.notch_q = self.spn_notch_q.value()
@@ -1234,6 +1391,11 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         self.data_buffer = np.vstack(
             (self.data_buffer[n_samples:, :], packet_uV)
         )
+
+        if self.is_recording:
+            self.recorded_chunks.append(packet_uV.copy())
+            sample_count = sum(len(c) for c in self.recorded_chunks)
+            self.lbl_record_status.setText(f"Rec: {sample_count} samples")
 
         for ch in range(N_CHANNELS):
             lbl_s1 = self.tbl_debug.cellWidget(ch, 1)
@@ -1268,16 +1430,17 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         if self.data_buffer.shape[0] < 30:
             return
 
-        # 1. Apply Filtering (Including optional DC Offset removal)
         if self.chk_show_filtered.isChecked():
             display_data = apply_signal_filters(
                 self.data_buffer,
                 self.sample_rate,
                 self.dc_remove_enabled,
-                self.bp_enabled,
-                self.bp_low,
-                self.bp_high,
-                self.bp_order,
+                self.hp_enabled,
+                self.hp_freq,
+                self.hp_order,
+                self.lp_enabled,
+                self.lp_freq,
+                self.lp_order,
                 self.notch_enabled,
                 self.notch_freq,
                 self.notch_q,
@@ -1285,14 +1448,13 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         else:
             display_data = self.data_buffer.copy()
 
-        # 2. Update Time Domain Oscilloscope Traces
-        offset_step = 100.0
+        # 1. Oscilloscope Traces with Live Offset
         for ch in range(N_CHANNELS):
             if self.visible_channels[ch] and self.powerdowns[ch] == 0:
-                y = display_data[:, ch] + (ch * offset_step)
+                y = display_data[:, ch] + (ch * self.channel_offset)
                 self.time_curves[ch].setData(y)
 
-        # 3. Update Frequency Domain FFT Traces
+        # 2. FFT Power Spectrum Traces
         n_pts = display_data.shape[0]
         freqs = np.fft.rfftfreq(n_pts, 1.0 / self.sample_rate)
         for ch in range(N_CHANNELS):
@@ -1302,19 +1464,18 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
                 ) * 2.0
                 self.fft_curves[ch].setData(freqs, fft_vals)
 
-        # 4. Update 10-20 Topographic Brain Map & Band Power Analysis
+        # 3. Live 10-20 Heatmap & Band Analysis
         self.update_brain_map_and_bands(display_data)
 
     def update_brain_map_and_bands(self, display_data):
         selected_band_name = self.cmb_band_select.currentText()
         selected_band_limits = EEG_BANDS[selected_band_name]
 
-        spot_list = []
         for t_item in self.topo_text_items:
             self.plot_topo.removeItem(t_item)
         self.topo_text_items.clear()
 
-        # Compute Band Powers per Channel
+        # Calculate per-channel band powers
         channel_band_powers = np.zeros(N_CHANNELS)
         for ch in range(N_CHANNELS):
             if self.powerdowns[ch] == 0:
@@ -1322,9 +1483,10 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
                     display_data[:, ch], self.sample_rate, selected_band_limits
                 )
 
-        max_p = max(1e-6, np.max(channel_band_powers))
+        # Collect Active Channel Coordinates for Interpolation
+        x_coords, y_coords, z_powers = [], [], []
+        spot_list = []
 
-        # Build Scatter Nodes for Active Mapped 10-20 Electrodes
         for ch in range(N_CHANNELS):
             if self.powerdowns[ch] == 1:
                 continue
@@ -1333,21 +1495,18 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
             pos_info = ELECTRODE_1020_POS.get(pos_label, (0.0, 0.0, "Unknown"))
             x_pos, y_pos, _ = pos_info
 
-            norm_val = np.clip(channel_band_powers[ch] / max_p, 0.0, 1.0)
-            # Dracula Color Intensity gradient (Purple -> Pink -> Yellow)
-            r = int(189 + norm_val * (255 - 189))
-            g = int(147 + norm_val * (121 - 147))
-            b = int(249 + norm_val * (198 - 249))
+            x_coords.append(x_pos)
+            y_coords.append(y_pos)
+            z_powers.append(channel_band_powers[ch])
 
             spot_list.append(
                 {
                     "pos": (x_pos, y_pos),
-                    "brush": pg.mkBrush(r, g, b, 230),
-                    "pen": pg.mkPen(DRACULA["fg"], width=1.5),
+                    "brush": pg.mkBrush(DRACULA["fg"]),
+                    "pen": pg.mkPen(DRACULA["bg"], width=1.5),
                 }
             )
 
-            # Text Label for Electrode
             txt = pg.TextItem(
                 text=f"{pos_label}\n(Ch{ch+1})", color=DRACULA["fg"], anchor=(0.5, 0.5)
             )
@@ -1357,7 +1516,46 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
 
         self.scatter_nodes.setData(spot_list)
 
-        # 5. Calculate Activity Power by Brain Region
+        # ----------------------------------------------------------------------
+        # 2D RADIAL BASIS FUNCTION (RBF) SPATIAL INTERPOLATION FOR HEATMAP
+        # ----------------------------------------------------------------------
+        if len(x_coords) >= 3:
+            try:
+                rbf = Rbf(x_coords, y_coords, z_powers,
+                          function="multiquadric", smooth=0.05)
+                grid_z = rbf(self.grid_x, self.grid_y)
+            except Exception:
+                grid_z = griddata(
+                    (x_coords, y_coords),
+                    z_powers,
+                    (self.grid_x, self.grid_y),
+                    method="linear",
+                    fill_value=0.0,
+                )
+
+            z_min, z_max = np.min(grid_z), np.max(grid_z)
+            if z_max > z_min:
+                norm_z = np.clip((grid_z - z_min) / (z_max - z_min), 0.0, 1.0)
+            else:
+                norm_z = np.zeros_like(grid_z)
+
+            # Map Normalized Grid to RGBA LUT Colors
+            color_indices = (norm_z * 255.0).astype(np.uint8)
+            rgba_image = self.dracula_lut[color_indices]
+
+            # Mask out region outside circular scalp geometry
+            rgba_image[self.head_mask, 3] = 0
+
+            # Transpose array for PyQtGraph (X, Y, RGBA) and explicitly set bounds rect
+            self.topo_img.setImage(
+                np.transpose(rgba_image, (1, 0, 2)),
+                levels=(0, 255),
+                rect=self.heatmap_rect,
+            )
+
+        # ----------------------------------------------------------------------
+        # BAR CHARTS: REGIONAL & GLOBAL BAND POWER
+        # ----------------------------------------------------------------------
         region_power = {
             "Frontal": 0.0,
             "Central": 0.0,
@@ -1377,13 +1575,10 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         reg_heights = []
         for reg_key in ["Frontal", "Central", "Parietal", "Occipital", "Temporal"]:
             cnt = region_counts[reg_key]
-            reg_heights.append(
-                region_power[reg_key] / cnt if cnt > 0 else 0.0
-            )
+            reg_heights.append(region_power[reg_key] / cnt if cnt > 0 else 0.0)
 
         self.region_bars.setOpts(height=reg_heights)
 
-        # 6. Calculate Spectrum Power across Frequency Bands
         band_heights = []
         for b_name, b_lims in EEG_BANDS.items():
             tot_b_power = 0.0
