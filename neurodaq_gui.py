@@ -62,6 +62,10 @@ SAMPLE_RATE_MAP = {
 GAIN_MAP = {0: 1.0, 1: 2.0, 2: 4.0, 3: 6.0, 4: 8.0, 5: 12.0, 6: 24.0}
 LEADOFF_CURRENT_MAP = {0: 6e-9, 1: 24e-9, 2: 6e-6, 3: 24e-6}
 LEADOFF_FREQ_MAP = {0: 0.0, 1: 7.8, 2: 31.2, 3: None}
+# LOFF COMP_TH codes 0-7: lower % of rail = trips earlier = more sensitive.
+LEADOFF_THRESHOLD_PCT = {0: 95.0, 1: 92.5, 2: 90.0, 3: 87.5, 4: 85.0, 5: 80.0, 6: 75.0, 7: 70.0}
+# Series protection resistor per channel (R1-R9 on main PCB); subtracted from |Z|.
+SERIES_R_OHMS = 2200.0
 
 # ==============================================================================
 # 10-20 ELECTRODE COORDINATES & BRAIN REGION DEFINITIONS
@@ -322,7 +326,9 @@ class UDPDataReceiver(QtCore.QThread):
 
         self.loff_enabled = False
         self.loff_freq_val = 31.2
-        self.loff_current_val = 6e-9
+        self.loff_freq_code = 2
+        self.loff_current_val = 24e-6
+        self.loff_current_code = 3
 
         self.buffer_size = int(self.sample_rate)
         self.raw_uV_buffers = [
@@ -330,8 +336,14 @@ class UDPDataReceiver(QtCore.QThread):
         ]
 
         self.impedances = np.zeros(N_CHANNELS)
+        self.measurements = [None] * N_CHANNELS
         self.stat1_flags = [False] * N_CHANNELS
         self.stat2_flags = [False] * N_CHANNELS
+        # Calibration: measured-loop-ohms -> true-loop-ohms scale, keyed by
+        # (freq_code, current_code). Absorbs current-source tolerance (+/-20%
+        # per datasheet — the dominant error), filter rolloff and nominal
+        # shunt-divider systematics at the cal point. Set via calibrate().
+        self.cal_factors = {}
 
         self.lsl_outlet = None
         self.setup_lsl()
@@ -364,29 +376,120 @@ class UDPDataReceiver(QtCore.QThread):
     def update_gain(self, ch_idx, gain_val):
         self.gains[ch_idx] = gain_val
 
-    def update_leadoff_config(self, enabled, freq_val, current_val):
+    def update_leadoff_config(self, enabled, freq_val, current_val, freq_code=2, current_code=3):
         self.loff_enabled = enabled
         self.loff_freq_val = freq_val
         self.loff_current_val = current_val
+        self.loff_freq_code = freq_code
+        self.loff_current_code = current_code
+
+    @staticmethod
+    def _tone_peak_uV(data, freq_hz, sample_rate):
+        # Single-frequency DFT via direct sin/cos correlation (exact at any
+        # freq — no FFT bin quantization, so 7.8/31.2/fDR/4 all resolve).
+        # Returns fundamental 0-peak amplitude in the same units as data.
+        n = np.arange(len(data))
+        window = np.hanning(len(data))
+        ang = 2.0 * np.pi * freq_hz * n / sample_rate
+        xc = float(np.sum(data * window * np.cos(ang)))
+        xs = float(np.sum(data * window * np.sin(ang)))
+        return 2.0 * np.sqrt(xc * xc + xs * xs) / float(np.sum(window))
+
+    def fullscale_pos_uV(self, ch_idx):
+        # +Full-scale (0x7FFFFF) in uV for this channel's gain.
+        return (VREF / self.gains[ch_idx]) * 1e6 / 2.0
+
+    def measure_channel(self, ch_idx):
+        # Full AC lead-off measurement with validity flags. Physics per
+        # ADS1299 datasheet/TI SLAU443: the AC excitation is a square wave
+        # toggling +/-I, so the differential fundamental (0-pk) is
+        #   Vfund = (4/pi) * I * (Zp + Zn)
+        # where Zp = channel electrode impedance and Zn = shared REF
+        # electrode impedance (SRB1). We therefore report LOOP impedance
+        # (Zp+Zn, both sides' 2.2k series R removed), not single-electrode Z.
+        res = {
+            "z_kohm": 0.0,
+            "tone_uVpk": 0.0,
+            "snr": 0.0,
+            "dc_mean_uV": 0.0,
+            "flags": [],
+            "cal_applied": False,
+        }
+        data = self.raw_uV_buffers[ch_idx]
+        if data.size >= 8:
+            res["dc_mean_uV"] = float(np.mean(data))
+        fs = self.fullscale_pos_uV(ch_idx)
+        if data.size >= 8 and abs(res["dc_mean_uV"]) > 0.8 * fs:
+            res["flags"].append("RAILED")
+        if data.size >= 8 and float(np.max(np.abs(data))) > 0.9 * fs:
+            res["flags"].append("OVERLOAD")
+            if self.loff_current_code in (2, 3):
+                res["flags"].append("TRY_DN_I_GAIN")
+        if not self.loff_enabled or self.loff_freq_val <= 0 or data.size < 32:
+            return res  # DC mode or disabled: no tone exists, 0.0 means "n/a"
+        v_fund_uV = self._tone_peak_uV(data, self.loff_freq_val, self.sample_rate)
+        # Adjacent-frequency noise floor (EEG background at the tone bin).
+        noise_floor = float(
+            np.median(
+                [
+                    self._tone_peak_uV(data, self.loff_freq_val + 3.0, self.sample_rate),
+                    self._tone_peak_uV(data, self.loff_freq_val - 3.0, self.sample_rate),
+                ]
+            )
+        )
+        res["tone_uVpk"] = v_fund_uV
+        res["snr"] = v_fund_uV / noise_floor if noise_floor > 0 else float("inf")
+        # Tiered SNR: floor subtraction of a large relative floor is itself a
+        # nonlinearity (error ~= -floor/tone), so gate by tier instead of
+        # silently biasing small tones. Bench mains/EMG pickup raises the
+        # floor; on-head with DRL it drops and tiers clear.
+        if res["snr"] < 4.0:
+            res["flags"].append("LOW_SNR")
+            if self.loff_current_code in (0, 1):
+                res["flags"].append("TRY_UP_I")
+            return res  # tone buried: any ohms number would be fiction
+        if res["snr"] < 8.0:
+            res["flags"].append("NOISY")  # value shown, expect ~+/-30%
+        v_sig_uV = max(0.0, v_fund_uV - noise_floor)
+        if self.loff_current_val <= 0:
+            return res
+        # Square-wave fundamental correction (pi/4) + two-sided loop model.
+        # NOTE: square wave also carries odd harmonics; the correlation reads
+        # only the fundamental, which is what the formula accounts for.
+        z_loop_ohms = (v_sig_uV * 1e-6) * (np.pi / 4.0) / self.loff_current_val
+        # Remove on-board series protection on BOTH sides (P 2.2k + REF 2.2k).
+        z_loop_ohms = max(0.0, z_loop_ohms - 2.0 * SERIES_R_OHMS)
+        factor = self.cal_factors.get((self.loff_freq_code, self.loff_current_code), 1.0)
+        if factor != 1.0:
+            res["cal_applied"] = True
+        res["z_kohm"] = z_loop_ohms * factor / 1000.0
+        return res
+
+    def calibrate(self, ch_idx, known_loop_kohm):
+        # Scale-factor calibration against a known loop resistor on ch_idx:
+        # factor = true/measured at the current (freq, current) setting.
+        # Calibrate near the impedance decade you care about; the 1nF shunt
+        # divider is R-dependent so one cal point is exact only near itself.
+        m = self.measure_channel(ch_idx)
+        if (
+            "OVERLOAD" in m["flags"]
+            or "LOW_SNR" in m["flags"]
+            or "NOISY" in m["flags"]
+            or "RAILED" in m["flags"]
+            or m["z_kohm"] <= 0
+        ):
+            return None
+        raw_kohm = m["z_kohm"] / self.cal_factors.get(
+            (self.loff_freq_code, self.loff_current_code), 1.0
+        )
+        if raw_kohm <= 0:
+            return None
+        factor = known_loop_kohm / raw_kohm
+        self.cal_factors[(self.loff_freq_code, self.loff_current_code)] = factor
+        return factor
 
     def calculate_impedance(self, ch_idx):
-        data = self.raw_uV_buffers[ch_idx]
-        if not self.loff_enabled or self.loff_freq_val <= 0 or data.size < 32:
-            return 0.0
-
-        freqs = np.fft.rfftfreq(len(data), 1.0 / self.sample_rate)
-        fft_vals = np.abs(np.fft.rfft(data)) / len(data)
-
-        target_bin = np.argmin(np.abs(freqs - self.loff_freq_val))
-        v_peak_uV = fft_vals[target_bin] * 2.0
-        v_rms_volts = (v_peak_uV * 1e-6) / np.sqrt(2)
-
-        i_rms = self.loff_current_val / np.sqrt(2)
-        if i_rms <= 0:
-            return 0.0
-
-        z_ohms = v_rms_volts / i_rms
-        return z_ohms / 1000.0
+        return self.measure_channel(ch_idx)["z_kohm"]
 
     def run(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -414,16 +517,18 @@ class UDPDataReceiver(QtCore.QThread):
             packet_uV = np.zeros((N_SAMPLES_PER_PACKET, N_CHANNELS))
             sample_payload = unpacked[2:-1]
 
-            last_stat1 = 0
-            last_stat2 = 0
+            # OR status over all 25 samples: a lead-off flag on any sample in
+            # the packet latches for the packet (clears on next clean packet).
+            pkt_stat1 = 0
+            pkt_stat2 = 0
 
             for s_idx in range(N_SAMPLES_PER_PACKET):
                 base_i = s_idx * 12
                 b1 = sample_payload[base_i + 1]
                 b2 = sample_payload[base_i + 2]
 
-                last_stat1 = b1
-                last_stat2 = b2
+                pkt_stat1 |= b1
+                pkt_stat2 |= b2
 
                 raw_channels = sample_payload[base_i + 3: base_i + 11]
 
@@ -442,10 +547,11 @@ class UDPDataReceiver(QtCore.QThread):
                 self.raw_uV_buffers[ch][-N_SAMPLES_PER_PACKET:] = packet_uV[
                     :, ch
                 ]
-                self.impedances[ch] = self.calculate_impedance(ch)
+                self.measurements[ch] = self.measure_channel(ch)
+                self.impedances[ch] = self.measurements[ch]["z_kohm"]
 
-                self.stat1_flags[ch] = bool((last_stat1 >> ch) & 0x01)
-                self.stat2_flags[ch] = bool((last_stat2 >> ch) & 0x01)
+                self.stat1_flags[ch] = bool((pkt_stat1 >> ch) & 0x01)
+                self.stat2_flags[ch] = bool((pkt_stat2 >> ch) & 0x01)
 
             for sample in packet_uV:
                 self.lsl_outlet.push_sample(sample.tolist())
@@ -1076,7 +1182,10 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         loff_grid = QtWidgets.QGridLayout(grp_loff_cfg)
 
         self.chk_loff_enable = QtWidgets.QCheckBox("Enable Lead-Off Circuit")
-        self.chk_loff_enable.setChecked(True)
+        self.chk_loff_enable.setChecked(False)
+        self.chk_loff_enable.setToolTip(
+            "Firmware engine is OFF by default. Push while stopped to enable."
+        )
 
         self.cmb_loff_freq = QtWidgets.QComboBox()
         self.cmb_loff_freq.addItem("DC Lead-Off", 0)
@@ -1090,17 +1199,73 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         self.cmb_loff_curr.addItem("24 nA", 1)
         self.cmb_loff_curr.addItem("6 uA", 2)
         self.cmb_loff_curr.addItem("24 uA", 3)
-        self.cmb_loff_curr.setCurrentIndex(0)
+        self.cmb_loff_curr.setCurrentIndex(3)
+        self.cmb_loff_curr.setToolTip(
+            "AC impedance needs uA range (bring-up: 24 uA). nA is DC-only scale."
+        )
+
+        self.cmb_loff_thresh = QtWidgets.QComboBox()
+        for code in range(8):
+            self.cmb_loff_thresh.addItem(
+                f"{LEADOFF_THRESHOLD_PCT[code]:g}%", code
+            )
+        self.cmb_loff_thresh.setCurrentIndex(4)
+        self.cmb_loff_thresh.setToolTip(
+            "Comparator threshold: lower % = trips earlier = more sensitive. "
+            "Bring-up sweep 85% -> 75% -> 70%."
+        )
 
         btn_loff_apply = QtWidgets.QPushButton("Push Lead-Off Config")
         btn_loff_apply.clicked.connect(self.apply_leadoff_config)
+
+        btn_loff_dump = QtWidgets.QPushButton("Dump Lead-Off Regs")
+        btn_loff_dump.setToolTip(
+            "STOP acquisition first, then read back LOFF/CONFIG4/STAT regs. "
+            "Short one electrode and compare register bits vs streamed flags."
+        )
+        btn_loff_dump.clicked.connect(self.dump_leadoff_regs)
 
         loff_grid.addWidget(self.chk_loff_enable, 0, 0)
         loff_grid.addWidget(QtWidgets.QLabel("Frequency:"), 0, 1)
         loff_grid.addWidget(self.cmb_loff_freq, 0, 2)
         loff_grid.addWidget(QtWidgets.QLabel("Current:"), 0, 3)
         loff_grid.addWidget(self.cmb_loff_curr, 0, 4)
-        loff_grid.addWidget(btn_loff_apply, 0, 5)
+        loff_grid.addWidget(QtWidgets.QLabel("Threshold:"), 0, 5)
+        loff_grid.addWidget(self.cmb_loff_thresh, 0, 6)
+        loff_grid.addWidget(btn_loff_apply, 0, 7)
+        loff_grid.addWidget(btn_loff_dump, 1, 7)
+
+        self.txt_tcp_log = QtWidgets.QTextEdit()
+        self.txt_tcp_log.setReadOnly(True)
+        self.txt_tcp_log.setMaximumHeight(90)
+        self.txt_tcp_log.setStyleSheet(
+            f"background-color: {DRACULA['bg']}; color: {DRACULA['comment']};"
+        )
+        loff_grid.addWidget(QtWidgets.QLabel("TCP responses:"), 1, 0)
+        loff_grid.addWidget(self.txt_tcp_log, 1, 1, 1, 6)
+
+        self.spn_cal_r = QtWidgets.QDoubleSpinBox()
+        self.spn_cal_r.setRange(0.1, 5000.0)
+        self.spn_cal_r.setValue(1000.0)
+        self.spn_cal_r.setSuffix(" kΩ")
+        self.spn_cal_r.setToolTip(
+            "Known CH1 loop resistance (dummy + leads, REF shorted so Zn≈0). "
+            "Calibrate near the decade you measure: absorbs current-source "
+            "(±20%), filter and divider systematics at this point."
+        )
+        btn_loff_cal = QtWidgets.QPushButton("Calibrate CH1")
+        btn_loff_cal.clicked.connect(self.calibrate_ch1)
+        btn_loff_cal_clear = QtWidgets.QPushButton("Clear cal")
+        btn_loff_cal_clear.clicked.connect(self.clear_calibration)
+        self.lbl_cal_status = QtWidgets.QLabel("Cal: none")
+        self.lbl_cal_status.setStyleSheet(
+            f"color: {DRACULA['comment']}; font-weight: bold;"
+        )
+        loff_grid.addWidget(QtWidgets.QLabel("Known R:"), 2, 0)
+        loff_grid.addWidget(self.spn_cal_r, 2, 1)
+        loff_grid.addWidget(btn_loff_cal, 2, 2)
+        loff_grid.addWidget(btn_loff_cal_clear, 2, 3)
+        loff_grid.addWidget(self.lbl_cal_status, 2, 4, 1, 3)
 
         debug_layout.addWidget(grp_loff_cfg)
 
@@ -1109,13 +1274,15 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         )
         diag_lay = QtWidgets.QVBoxLayout(grp_diag)
 
-        self.tbl_debug = QtWidgets.QTableWidget(N_CHANNELS, 4)
+        self.tbl_debug = QtWidgets.QTableWidget(N_CHANNELS, 6)
         self.tbl_debug.setHorizontalHeaderLabels(
             [
                 "Channel",
-                "STAT1: Pos DC Lead-Off",
-                "STAT2: Neg DC Lead-Off",
-                "Calculated Impedance Z (kΩ)",
+                "STAT1: Pos DC Lead-Off (per-ch)",
+                "STAT2: REF-global (shared N via SRB1)",
+                "Loop Impedance Zp+Zn (kΩ)",
+                "Tone fund. (µVpk)",
+                "Flags",
             ]
         )
         self.tbl_debug.horizontalHeader().setSectionResizeMode(
@@ -1139,15 +1306,29 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
                 f"background-color: {DRACULA['green']}; color: #1e1f29; border-radius: 3px; font-weight: bold;"
             )
 
-            lbl_imp = QtWidgets.QLabel("0.0 kΩ")
+            lbl_imp = QtWidgets.QLabel("—")
             lbl_imp.setAlignment(QtCore.Qt.AlignCenter)
             lbl_imp.setStyleSheet(
                 f"font-size: 13px; font-weight: bold; color: {DRACULA['yellow']};"
             )
 
+            lbl_tone = QtWidgets.QLabel("—")
+            lbl_tone.setAlignment(QtCore.Qt.AlignCenter)
+            lbl_tone.setStyleSheet(
+                f"font-size: 12px; color: {DRACULA['cyan']};"
+            )
+
+            lbl_flags = QtWidgets.QLabel("")
+            lbl_flags.setAlignment(QtCore.Qt.AlignCenter)
+            lbl_flags.setStyleSheet(
+                f"font-size: 12px; font-weight: bold; color: {DRACULA['orange']};"
+            )
+
             self.tbl_debug.setCellWidget(ch, 1, lbl_stat1)
             self.tbl_debug.setCellWidget(ch, 2, lbl_stat2)
             self.tbl_debug.setCellWidget(ch, 3, lbl_imp)
+            self.tbl_debug.setCellWidget(ch, 4, lbl_tone)
+            self.tbl_debug.setCellWidget(ch, 5, lbl_flags)
 
         diag_lay.addWidget(self.tbl_debug)
         debug_layout.addWidget(grp_diag)
@@ -1193,6 +1374,58 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
 
     def on_tcp_response(self, resp):
         print(f"[TCP Response] {resp}")
+        try:
+            ok = bool(resp.get("success", False))
+            msg = str(resp.get("message", ""))
+        except Exception:
+            return
+        # Surface control-plane results in the top bar; config_leadoff is
+        # rejected while acquiring (needs stop -> config -> start).
+        self.lbl_tcp_status.setText(f"TCP: {'OK' if ok else 'ERR'}: {msg}")
+        self.lbl_tcp_status.setStyleSheet(
+            f"color: {DRACULA['green'] if ok else DRACULA['red']}; "
+            "font-weight: bold; margin-right: 15px;"
+        )
+        if hasattr(self, "txt_tcp_log"):
+            self.txt_tcp_log.append(f"[{'OK' if ok else 'ERR'}] {msg}")
+        if not ok and "acquisition" in msg.lower():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Config Rejected While Acquiring",
+                f"{msg}\n\nFirmware requires: STOP -> push config -> START.",
+            )
+
+    def dump_leadoff_regs(self):
+        # Read back the lead-off engine state for bench truth:
+        # LOFF (thresh/curr/freq), sense masks, CONFIG4 (comparator power),
+        # and live comparator status. STOP acquisition first (reads are
+        # rejected while streaming). Compare STATP/STATN bits against the
+        # streamed flags to isolate byte/bit mapping issues.
+        for addr in (0x04, 0x0F, 0x10, 0x11, 0x17, 0x12, 0x13):
+            self.send_cmd("read_reg", {"address": addr})
+
+    def calibrate_ch1(self):
+        known = float(self.spn_cal_r.value())
+        factor = self.udp_worker.calibrate(0, known)
+        if factor is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Calibration Failed",
+                "CH1 measurement is not usable (OVERLOAD / LOW_SNR / NOISY). "
+                "Fix range first: nA for ~1M, lower gain for uA.",
+            )
+            return
+        self.lbl_cal_status.setText(f"Cal: x{factor:.3f} (CH1, {known:g}k)")
+        self.lbl_cal_status.setStyleSheet(
+            f"color: {DRACULA['green']}; font-weight: bold;"
+        )
+
+    def clear_calibration(self):
+        self.udp_worker.cal_factors.clear()
+        self.lbl_cal_status.setText("Cal: none")
+        self.lbl_cal_status.setStyleSheet(
+            f"color: {DRACULA['comment']}; font-weight: bold;"
+        )
 
     def toggle_recording(self):
         if not self.is_recording:
@@ -1347,19 +1580,61 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
         enabled = self.chk_loff_enable.isChecked()
         freq_code = self.cmb_loff_freq.currentData()
         curr_code = self.cmb_loff_curr.currentData()
+        thresh_code = self.cmb_loff_thresh.currentData()
 
         if freq_code == 3:
             freq_val = self.sample_rate / 4.0
         else:
             freq_val = LEADOFF_FREQ_MAP[freq_code]
 
+        # fDR/4 must stay comfortably below Nyquist.
+        if freq_code == 3 and freq_val >= 0.45 * self.sample_rate:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Lead-Off Frequency Rejected",
+                f"fDR/4 = {freq_val:.1f} Hz is too close to Nyquist "
+                f"({self.sample_rate / 2.0:.1f} Hz). Lower the sample rate "
+                "or pick 7.8/31.2 Hz.",
+            )
+            return
+
         curr_val = LEADOFF_CURRENT_MAP[curr_code]
 
-        self.udp_worker.update_leadoff_config(enabled, freq_val, curr_val)
+        if enabled and freq_code != 0 and curr_code in (0, 1):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Weak AC Excitation",
+                "AC impedance with nA-range current only resolves large "
+                "impedances (>=100k). For ~10k dummies use uA + low gain. "
+                "Pushing anyway.",
+            )
+
+        if enabled and freq_code != 0 and curr_code in (2, 3):
+            # Saturation headroom: Vpp = 2*I*Zloop must fit in VREF/gain.
+            # Zloop >= 2x2.2k series alone; warn when even that clips.
+            min_zloop = 2.0 * SERIES_R_OHMS
+            for ch in range(N_CHANNELS):
+                vpp_min = 2.0 * curr_val * min_zloop
+                adc_range = VREF / self.gains[ch]
+                if vpp_min > 0.5 * adc_range:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "AC Excitation Will Saturate",
+                        f"Ch{ch+1}: uA current at gain {self.gains[ch]:g} "
+                        f"saturates on the 2x2.2k series R alone "
+                        f"(Vpp~{vpp_min*1e3:.0f}mV vs range "
+                        f"{adc_range*1e3:.0f}mVpp). Lower gain to <=8 or "
+                        "use nA current. Pushing anyway.",
+                    )
+                    break
+
+        self.udp_worker.update_leadoff_config(
+            enabled, freq_val, curr_val, freq_code, curr_code
+        )
 
         params = {
             "enabled": enabled,
-            "threshold": 4,
+            "threshold": thresh_code,
             "current": curr_code,
             "frequency": freq_code,
             "sensp": 255,
@@ -1410,21 +1685,39 @@ class NeuroDAQGUI(QtWidgets.QMainWindow):
                     f"background-color: {DRACULA['green']}; color: #1e1f29; border-radius: 3px; font-weight: bold;"
                 )
 
+            # STATN is REF-global under common SRB1 reference: all N inputs
+            # are the same physical REF node, so any set bit means REF lifted.
             lbl_s2 = self.tbl_debug.cellWidget(ch, 2)
-            if stat2_flags[ch]:
-                lbl_s2.setText("LEAD OFF (RAIL-)")
+            ref_off = any(stat2_flags)
+            if ref_off:
+                lbl_s2.setText("REF OFF (RAIL-)")
                 lbl_s2.setStyleSheet(
                     f"background-color: {DRACULA['red']}; color: {DRACULA['fg']}; border-radius: 3px; font-weight: bold;"
                 )
             else:
-                lbl_s2.setText("CONNECTED")
+                lbl_s2.setText("REF OK")
                 lbl_s2.setStyleSheet(
                     f"background-color: {DRACULA['green']}; color: #1e1f29; border-radius: 3px; font-weight: bold;"
                 )
 
             lbl_imp = self.tbl_debug.cellWidget(ch, 3)
-            imp_val = self.udp_worker.impedances[ch]
-            lbl_imp.setText(f"{imp_val:.2f} kΩ")
+            lbl_tone = self.tbl_debug.cellWidget(ch, 4)
+            lbl_flags = self.tbl_debug.cellWidget(ch, 5)
+            meas = self.udp_worker.measurements[ch]
+            if meas is None or not self.udp_worker.loff_enabled or self.udp_worker.loff_freq_val <= 0:
+                lbl_imp.setText("—")
+                lbl_tone.setText("—")
+                lbl_flags.setText("")
+            else:
+                if "OVERLOAD" in meas["flags"] or "RAILED" in meas["flags"]:
+                    lbl_imp.setText("SAT")
+                elif "LOW_SNR" in meas["flags"]:
+                    lbl_imp.setText("low SNR")
+                else:
+                    cal_mark = " ✓" if meas.get("cal_applied") else ""
+                    lbl_imp.setText(f"{meas['z_kohm']:.2f} kΩ{cal_mark}")
+                lbl_tone.setText(f"{meas['tone_uVpk']:.0f} @G{self.gains[ch]:g}")
+                lbl_flags.setText(" ".join(meas["flags"]))
 
     def redraw_plots(self):
         if self.data_buffer.shape[0] < 30:
